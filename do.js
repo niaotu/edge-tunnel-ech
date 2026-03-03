@@ -1,7 +1,6 @@
 import { connect } from 'cloudflare:sockets';
 
 const WS_READY_STATE_OPEN = 1;
-const WS_READY_STATE_CLOSING = 2;
 const CF_FALLBACK_IPS = ['proxyip.cmliussss.net:443'];
 const encoder = new TextEncoder();
 
@@ -9,14 +8,17 @@ export class TunnelProxy {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.sessions = new Map();
   }
 
   async fetch(request) {
-    const [client, server] = Object.values(new WebSocketPair());
+    const webSocketPair = new WebSocketPair();
+    const [client, server] = Object.values(webSocketPair);
 
-    // ✅ Hibernation API：空闲时 DO 休眠不计费
-    this.ctx.acceptWebSocket(server);
+    // 使用 Hibernation API 接受连接，支持空闲不计费
+    this.state.acceptWebSocket(server);
+
+    // 可选：初始化 attachment（这里为空对象，后面会动态设置）
+    server.serializeAttachment({});
 
     return new Response(null, {
       status: 101,
@@ -24,132 +26,154 @@ export class TunnelProxy {
     });
   }
 
-  // ─── Hibernation 钩子 ─────────────────────────────────────────────────
+  // ────────────────────────────────
+  // Hibernation 事件处理方法
+  // ────────────────────────────────
+
   async webSocketMessage(ws, message) {
-    let session = this.sessions.get(ws);
-    if (!session) {
-      session = { remoteSocket: null, remoteWriter: null, isClosed: false };
-      this.sessions.set(ws, session);
-    }
-    if (session.isClosed) return;
+    const attachment = ws.deserializeAttachment() || {};
+    if (attachment.isClosed) return;
 
     try {
       if (typeof message === 'string') {
         if (message.startsWith('CONNECT:')) {
           const sep = message.indexOf('|', 8);
           if (sep < 0) throw new Error('Invalid CONNECT frame');
-          await this._connectToRemote(
-            ws, session,
-            message.substring(8, sep),
-            message.substring(sep + 1)
-          );
-        } else if (message.startsWith('DATA:') && session.remoteWriter) {
-          await session.remoteWriter.write(encoder.encode(message.substring(5)));
-        } else if (message === 'CLOSE') {
-          this._cleanup(ws, session);
+
+          const targetAddr = message.substring(8, sep);
+          const firstFrameData = message.substring(sep + 1);
+
+          await this.connectToRemote(ws, targetAddr, firstFrameData);
+          ws.send('CONNECTED');
+        } 
+        else if (message.startsWith('DATA:')) {
+          if (attachment.remoteWriter) {
+            await attachment.remoteWriter.write(encoder.encode(message.substring(5)));
+          }
+        } 
+        else if (message === 'CLOSE') {
+          this.cleanup(ws);
         }
-      } else if (message instanceof ArrayBuffer && session.remoteWriter) {
-        await session.remoteWriter.write(new Uint8Array(message));
+      } 
+      else if (message instanceof ArrayBuffer && attachment.remoteWriter) {
+        await attachment.remoteWriter.write(new Uint8Array(message));
       }
     } catch (err) {
       try { ws.send('ERROR:' + err.message); } catch {}
-      this._cleanup(ws, session);
+      this.cleanup(ws);
     }
   }
 
-  async webSocketClose(ws) {
-    const session = this.sessions.get(ws);
-    if (session) this._cleanup(ws, session);
+  async webSocketClose(ws, code, reason) {
+    this.cleanup(ws);
   }
 
-  async webSocketError(ws) {
-    const session = this.sessions.get(ws);
-    if (session) this._cleanup(ws, session);
-  }
+  // 可选：如果需要区分错误关闭
+  // webSocketError(ws, error) { this.cleanup(ws); }
 
-  // ─── 连接远端 ─────────────────────────────────────────────────────────
-  async _connectToRemote(ws, session, targetAddr, firstFrameData) {
-    const { host: targetHost, port: targetPort } = this._parseAddress(targetAddr);
-    if (!targetHost || !targetPort) throw new Error('Invalid CONNECT target');
+  // ────────────────────────────────
+  // 核心连接逻辑
+  // ────────────────────────────────
+
+  async connectToRemote(ws, targetAddr, firstFrameData) {
+    const attachment = ws.deserializeAttachment() || {};
+    this.cleanup(ws);  // 先清理旧连接（如果存在）
+
+    const { host: targetHost, port: targetPort } = this.parseAddress(targetAddr);
+    if (!targetHost || !targetPort) {
+      throw new Error('Invalid CONNECT target, expected host:port');
+    }
 
     const attempts = [null, ...CF_FALLBACK_IPS];
 
-    for (let i = 0; i < attempts.length; i++) {
-      let hostname, port;
+    for (const attempt of attempts) {
+      let hostname = targetHost;
+      let port = targetPort;
 
-      if (attempts[i]) {
-        const parsed = this._parseAddress(attempts[i], targetPort);
+      if (attempt) {
+        const parsed = this.parseAddress(attempt, targetPort);
         hostname = parsed.host;
         port = parsed.port;
-      } else {
-        hostname = targetHost;
-        port = targetPort;
       }
 
       try {
         const remoteSocket = connect({ hostname, port });
-        await remoteSocket.opened;
+        await remoteSocket.opened;  // 等待连接建立
 
-        session.remoteSocket = remoteSocket;
-        session.remoteWriter = remoteSocket.writable.getWriter();
+        const remoteWriter = remoteSocket.writable.getWriter();
+        const remoteReader = remoteSocket.readable.getReader();
 
         if (firstFrameData) {
-          await session.remoteWriter.write(encoder.encode(firstFrameData));
+          await remoteWriter.write(encoder.encode(firstFrameData));
         }
 
-        ws.send('CONNECTED');
+        // 保存到 attachment
+        ws.serializeAttachment({
+          ...attachment,
+          remoteSocket,
+          remoteWriter,
+          remoteReader,
+          isClosed: false
+        });
 
-        // ✅ 关键修复：用 pipeTo 替代手动 reader 循环
-        // pipeTo 是底层 I/O 操作，DO 休眠不会中断数据流
-        remoteSocket.readable.pipeTo(new WritableStream({
-          write: (chunk) => {
-            if (ws.readyState === WS_READY_STATE_OPEN && chunk?.byteLength > 0) {
-              ws.send(chunk);
-            }
-          },
-          close: () => {
-            if (!session.isClosed) {
-              try { ws.send('CLOSE'); } catch {}
-              this._cleanup(ws, session);
-            }
-          },
-          abort: () => this._cleanup(ws, session),
-        })).catch(() => this._cleanup(ws, session));
-
+        this.pumpRemoteToWebSocket(ws);
         return;
-
       } catch (err) {
-        try { session.remoteWriter?.releaseLock(); } catch {}
-        try { session.remoteSocket?.close(); } catch {}
-        session.remoteWriter = null;
-        session.remoteSocket = null;
-
-        if (!this._isCFError(err) || i === attempts.length - 1) throw err;
+        if (!this.isCFError(err) || attempt === CF_FALLBACK_IPS.at(-1)) {
+          throw err;
+        }
+        // 清理本次失败的资源
+        // (writer/reader/close 在下次 cleanup 或下个循环处理)
       }
     }
   }
 
-  // ─── 清理 ─────────────────────────────────────────────────────────────
-  _cleanup(ws, session) {
-    if (session.isClosed) return;
-    session.isClosed = true;
-
-    try { session.remoteWriter?.releaseLock(); } catch {}
-    try { session.remoteSocket?.close(); } catch {}
-    session.remoteWriter = null;
-    session.remoteSocket = null;
-    this.sessions.delete(ws);
+  async pumpRemoteToWebSocket(ws) {
+    const { remoteReader } = ws.deserializeAttachment() || {};
+    if (!remoteReader) return;
 
     try {
-      if (ws.readyState === WS_READY_STATE_OPEN ||
-          ws.readyState === WS_READY_STATE_CLOSING) {
-        ws.close(1000, 'Server closed');
+      while (true) {
+        const { done, value } = await remoteReader.read();
+        if (done) break;
+
+        const att = ws.deserializeAttachment();
+        if (att.isClosed || ws.readyState !== WS_READY_STATE_OPEN) break;
+
+        if (value?.byteLength > 0) {
+          ws.send(value);
+        }
       }
     } catch {}
+
+    ws.send('CLOSE');
+    this.cleanup(ws);
   }
 
-  // ─── 工具函数 ─────────────────────────────────────────────────────────
-  _parseAddress(addr, defaultPort = null) {
+  // ────────────────────────────────
+  // 工具方法
+  // ────────────────────────────────
+
+  cleanup(ws) {
+    const attachment = ws.deserializeAttachment() || {};
+    if (attachment.isClosed) return;
+
+    attachment.isClosed = true;
+    ws.serializeAttachment(attachment);
+
+    try { attachment.remoteWriter?.releaseLock(); } catch {}
+    try { attachment.remoteReader?.releaseLock(); } catch {}
+    try { attachment.remoteSocket?.close(); } catch {}
+
+    // 清空 attachment 中的 socket 引用（可选，但有助于 GC）
+    ws.serializeAttachment({ isClosed: true });
+
+    if (ws.readyState === WS_READY_STATE_OPEN || ws.readyState === 2) {
+      try { ws.close(1000, 'Server closed'); } catch {}
+    }
+  }
+
+  parseAddress(addr, defaultPort = null) {
     if (addr.startsWith('[')) {
       const end = addr.indexOf(']');
       if (end === -1) return { host: addr, port: defaultPort };
@@ -161,17 +185,22 @@ export class TunnelProxy {
       }
       return { host, port: defaultPort };
     }
+
+    const sep = addr.lastIndexOf(':');
     const colonCount = (addr.match(/:/g) || []).length;
     if (colonCount > 1) return { host: addr, port: defaultPort };
-    const sep = addr.lastIndexOf(':');
+
     if (sep !== -1) {
       const port = parseInt(addr.substring(sep + 1), 10);
-      if (!Number.isNaN(port)) return { host: addr.substring(0, sep), port };
+      if (!Number.isNaN(port)) {
+        return { host: addr.substring(0, sep), port };
+      }
     }
+
     return { host: addr, port: defaultPort };
   }
 
-  _isCFError(err) {
+  isCFError(err) {
     const msg = err?.message?.toLowerCase() || '';
     return msg.includes('proxy request') ||
            msg.includes('cannot connect') ||
