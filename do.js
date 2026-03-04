@@ -5,26 +5,23 @@ const WS_READY_STATE_CLOSING = 2;
 const CF_FALLBACK_IPS = ['proxyip.cmliussss.net:443'];
 const encoder = new TextEncoder();
 
-// 配置常量
-const IDLE_TIMEOUT_MS = 60 * 1000; // 空闲 60 秒后断开
-const HEARTBEAT_INTERVAL_MS = 30 * 1000; // 30 秒心跳一次
-const MAX_IDLE_COUNT = 3; // 连续 3 次心跳无响应则断开
-
 export class TunnelProxy {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.idleTimer = null;
-    this.heartbeatTimer = null;
-    this.heartbeatMissCount = 0;
+    // 单例 DO 维护所有活跃 session 的 Map，key 为连接 ID
+    this.sessions = new Map();
   }
 
   async fetch(request) {
     const webSocketPair = new WebSocketPair();
     const [client, server] = Object.values(webSocketPair);
 
+    // 为每个连接分配唯一 ID
+    const sessionId = crypto.randomUUID();
+
     server.accept();
-    this.handleSession(server).catch(() => this.safeCloseWebSocket(server));
+    this.handleSession(sessionId, server).catch(() => this.safeCloseWebSocket(server));
 
     return new Response(null, {
       status: 101,
@@ -32,99 +29,41 @@ export class TunnelProxy {
     });
   }
 
-  // 重置空闲计时器
-  resetIdleTimer() {
-    if (this.idleTimer) {
-      clearTimeout(this.idleTimer);
-    }
-    this.idleTimer = setTimeout(() => {
-      this.handleIdleTimeout();
-    }, IDLE_TIMEOUT_MS);
-  }
+  async handleSession(sessionId, webSocket) {
+    const session = {
+      webSocket,
+      remoteSocket: null,
+      remoteWriter: null,
+      remoteReader: null,
+      isClosed: false,
+    };
 
-  // 处理空闲超时
-  handleIdleTimeout() {
-    try { this.webSocket?.send('IDLE_TIMEOUT'); } catch {}
-    this.cleanup();
-  }
-
-  // 启动心跳机制
-  startHeartbeat() {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-    }
-    this.heartbeatTimer = setInterval(() => {
-      this.sendHeartbeat();
-    }, HEARTBEAT_INTERVAL_MS);
-  }
-
-  // 发送心跳
-  async sendHeartbeat() {
-    try {
-      this.webSocket?.send('PING');
-      this.heartbeatMissCount++;
-      
-      if (this.heartbeatMissCount >= MAX_IDLE_COUNT) {
-        this.handleIdleTimeout();
-      }
-    } catch {}
-  }
-
-  // 收到pong响应
-  handlePong() {
-    this.heartbeatMissCount = 0;
-    this.resetIdleTimer();
-  }
-
-  async handleSession(webSocket) {
-    let remoteSocket;
-    let remoteWriter;
-    let remoteReader;
-    let isClosed = false;
-    this.webSocket = webSocket;
-
-    // 启动心跳和空闲计时
-    this.resetIdleTimer();
-    this.startHeartbeat();
+    this.sessions.set(sessionId, session);
 
     const cleanup = () => {
-      if (isClosed) return;
-      isClosed = true;
-      
-      // 清理定时器
-      if (this.idleTimer) {
-        clearTimeout(this.idleTimer);
-        this.idleTimer = null;
-      }
-      if (this.heartbeatTimer) {
-        clearInterval(this.heartbeatTimer);
-        this.heartbeatTimer = null;
-      }
-      this.webSocket = null;
-      
-      try { remoteWriter?.releaseLock(); } catch {}
-      try { remoteReader?.releaseLock(); } catch {}
-      try { remoteSocket?.close(); } catch {}
-      remoteWriter = null;
-      remoteReader = null;
-      remoteSocket = null;
+      if (session.isClosed) return;
+      session.isClosed = true;
+      try { session.remoteWriter?.releaseLock(); } catch {}
+      try { session.remoteReader?.releaseLock(); } catch {}
+      try { session.remoteSocket?.close(); } catch {}
+      session.remoteWriter = null;
+      session.remoteReader = null;
+      session.remoteSocket = null;
+      this.sessions.delete(sessionId);
       this.safeCloseWebSocket(webSocket);
     };
 
     const pumpRemoteToWebSocket = async () => {
       try {
-        while (!isClosed && remoteReader) {
-          const { done, value } = await remoteReader.read();
+        while (!session.isClosed && session.remoteReader) {
+          const { done, value } = await session.remoteReader.read();
           if (done) break;
           if (webSocket.readyState !== WS_READY_STATE_OPEN) break;
-          if (value?.byteLength > 0) {
-            webSocket.send(value);
-            this.resetIdleTimer(); // 收到数据重置空闲计时
-          }
+          if (value?.byteLength > 0) webSocket.send(value);
         }
       } catch {}
 
-      if (!isClosed) {
+      if (!session.isClosed) {
         try { webSocket.send('CLOSE'); } catch {}
         cleanup();
       }
@@ -194,27 +133,26 @@ export class TunnelProxy {
             port = targetPort;
           }
 
-          remoteSocket = connect({ hostname, port });
-          if (remoteSocket.opened) await remoteSocket.opened;
+          session.remoteSocket = connect({ hostname, port });
+          if (session.remoteSocket.opened) await session.remoteSocket.opened;
 
-          remoteWriter = remoteSocket.writable.getWriter();
-          remoteReader = remoteSocket.readable.getReader();
+          session.remoteWriter = session.remoteSocket.writable.getWriter();
+          session.remoteReader = session.remoteSocket.readable.getReader();
 
           if (firstFrameData) {
-            await remoteWriter.write(encoder.encode(firstFrameData));
+            await session.remoteWriter.write(encoder.encode(firstFrameData));
           }
 
           webSocket.send('CONNECTED');
-          this.resetIdleTimer(); // 连接成功重置空闲计时
           pumpRemoteToWebSocket();
           return;
         } catch (err) {
-          try { remoteWriter?.releaseLock(); } catch {}
-          try { remoteReader?.releaseLock(); } catch {}
-          try { remoteSocket?.close(); } catch {}
-          remoteWriter = null;
-          remoteReader = null;
-          remoteSocket = null;
+          try { session.remoteWriter?.releaseLock(); } catch {}
+          try { session.remoteReader?.releaseLock(); } catch {}
+          try { session.remoteSocket?.close(); } catch {}
+          session.remoteWriter = null;
+          session.remoteReader = null;
+          session.remoteSocket = null;
 
           if (!isCFError(err) || i === attempts.length - 1) {
             throw err;
@@ -224,18 +162,12 @@ export class TunnelProxy {
     };
 
     webSocket.addEventListener('message', async (event) => {
-      if (isClosed) return;
+      if (session.isClosed) return;
 
       try {
         const data = event.data;
 
         if (typeof data === 'string') {
-          // 处理心跳响应
-          if (data === 'PONG') {
-            this.handlePong();
-            return;
-          }
-          
           if (data.startsWith('CONNECT:')) {
             const sep = data.indexOf('|', 8);
             if (sep < 0) {
@@ -243,16 +175,14 @@ export class TunnelProxy {
             }
             await connectToRemote(data.substring(8, sep), data.substring(sep + 1));
           } else if (data.startsWith('DATA:')) {
-            if (remoteWriter) {
-              await remoteWriter.write(encoder.encode(data.substring(5)));
-              this.resetIdleTimer(); // 发送数据重置空闲计时
+            if (session.remoteWriter) {
+              await session.remoteWriter.write(encoder.encode(data.substring(5)));
             }
           } else if (data === 'CLOSE') {
             cleanup();
           }
-        } else if (data instanceof ArrayBuffer && remoteWriter) {
-          await remoteWriter.write(new Uint8Array(data));
-          this.resetIdleTimer(); // 发送数据重置空闲计时
+        } else if (data instanceof ArrayBuffer && session.remoteWriter) {
+          await session.remoteWriter.write(new Uint8Array(data));
         }
       } catch (err) {
         try { webSocket.send('ERROR:' + err.message); } catch {}
