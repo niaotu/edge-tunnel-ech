@@ -9,12 +9,12 @@ import { connect } from 'cloudflare:sockets';
 export default {
   async fetch(request, env, ctx) {
     try {
-      const token = 'chinadaja';
+      const token = 'chinadaja';  //密码验证
       const upgradeHeader = request.headers.get('Upgrade');
 
       if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
         return new URL(request.url).pathname === '/'
-          ? new Response('WebSocket Proxy Server', { status: 200 })
+          ? new Response('WebSocket Server', { status: 200 })
           : new Response('Expected WebSocket', { status: 426 });
       }
 
@@ -140,6 +140,7 @@ async function handleSession(webSocket, urlFallbacks = []) {
     }
   };
 
+  
   webSocket.addEventListener('message', async (event) => {
     if (isClosed) return;
     try {
@@ -147,6 +148,7 @@ async function handleSession(webSocket, urlFallbacks = []) {
       if (typeof data === 'string') {
         if (data.startsWith('CONNECT:')) {
           const sep = data.indexOf('|', 8);
+          if (sep === -1) throw new Error('Invalid CONNECT format');
           await connectToRemote(data.substring(8, sep), data.substring(sep + 1));
         } else if (data.startsWith('DATA:')) {
           if (remoteWriter) await remoteWriter.write(encoder.encode(data.substring(5)));
